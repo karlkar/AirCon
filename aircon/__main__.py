@@ -98,6 +98,8 @@ class KeepAliveThread(threading.Thread):
           self._establish_connection(conn)
         except:
           logging.exception('Failed to send local_reg keep alive to the AC.')
+          _thread.interrupt_main()
+          return
         logging.debug('[KeepAlive] Waiting for notification or timeout %d', self._data.commands_queue.qsize())
         self._json['local_reg']['notify'] = int(
             self._data.commands_queue.qsize() > 0 or self.run_lock.wait(self._KEEP_ALIVE_INTERVAL))
