@@ -43,7 +43,7 @@ class Config:
   app: Encryption
   dev: Encryption
 
-  def __init__(self, lanip_key: str, lanip_key_id: str):
+  def __init__(self, lanip_key: str, lanip_key_id: int):
     self._lan_config = LanConfig(lanip_key, lanip_key_id, '', 0, '', 0)
     self._update_encryption()
     

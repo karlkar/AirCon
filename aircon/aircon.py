@@ -21,12 +21,14 @@ from .properties import (AcProperties, AirFlow, Economy, FanSpeed, FastColdHeat,
     HumidifierProperties, Properties, Power, AcWorkMode, Quiet, TemperatureUnit)
 
 class BaseDevice:
-  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str, properties: Properties):
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str, 
+              properties: Properties, notifier: Callable[[None], None]):
     self.name = name
     self.ip_address = ip_address
     self._config = Config(lanip_key, lanip_key_id)
     self._properties = properties
     self._properties_lock = threading.Lock()
+    self._queue_listener = notifier
 
     self._next_command_id = 0
 
@@ -37,7 +39,7 @@ class BaseDevice:
     self._updates_seq_no = 0
     self._updates_seq_no_lock = threading.Lock()
 
-    self.change_listener: Callable[[str, str], None] = None
+    self.property_change_listener: Callable[[str, str], None] = None
 
   def get_all_properties(self) -> Properties:
     with self._properties_lock:
@@ -58,8 +60,8 @@ class BaseDevice:
       if value != old_value:
         setattr(self._properties, name, value)
         logging.debug('Updated properties: %s' % self._properties)
-      if self.change_listener:
-        self.change_listener(self.name, name, value)
+      if self.property_change_listener:
+        self.property_change_listener(self.name, name, value)
 
   def get_command_seq_no(self) -> int:
     with self._commands_seq_no_lock:
@@ -81,40 +83,26 @@ class BaseDevice:
     if self._properties.get_read_only(name):
       raise Error('Cannot update read-only property "{}".'.format(name))
     data_type = self._properties.get_type(name)
-    
-    if name != 't_control_value' and self.get_property('t_control_value'):
-      # Device mode is set using control_value
-      if issubclass(data_type, enum.Enum):
-        data_value = data_type[value]
-      elif data_type is int and type(value) is str and '.' in value:
-        # Round rather than fail if the input is a float.
-        # This is commonly the case for temperatures converted by HA from Celsius.
-        data_value = round(float(value))
-      else:
-        data_value = data_type(value)
-      self._convert_to_control_value(name, data_value)
-      return
-    
+
+    # Device mode is set using control_value
     if issubclass(data_type, enum.Enum):
-      data_value = data_type[value].value
+      data_value = data_type[value]
     elif data_type is int and type(value) is str and '.' in value:
       # Round rather than fail if the input is a float.
       # This is commonly the case for temperatures converted by HA from Celsius.
       data_value = round(float(value))
     else:
       data_value = data_type(value)
+    
+    # If device has set t_control_value it is being controlled by this field.
+    if name != 't_control_value' and self.get_property('t_control_value'):
+      self._convert_to_control_value(name, data_value)
+      return
+    
+    if issubclass(data_type, enum.Enum):
+      data_value = data_value.value
 
-    base_type = self._properties.get_base_type(name)
-    command = {
-      'properties': [{
-        'property': {
-          'base_type': base_type,
-          'name': name,
-          'value': data_value,
-          'id': ''.join(random.choices(string.ascii_letters + string.digits, k=8)),
-        }
-      }]
-    }
+    command = self._build_command(name, data_value)
     # There are (usually) no acks on commands, so also queue an update to the
     # property, to be run once the command is sent.
     typed_value = data_type[value] if issubclass(data_type, enum.Enum) else data_value
@@ -127,31 +115,24 @@ class BaseDevice:
       self.queue_command('t_fan_mute', 'OFF')
       self.queue_command('t_sleep', 'STOP')
       self.queue_command('t_temp_eight', 'OFF')
+    
+    self._queue_listener()
+
+  def _build_command(self, name: str, data_value: int):
+    base_type = self._properties.get_base_type(name)
+    return {
+      'properties': [{
+        'property': {
+          'base_type': base_type,
+          'name': name,
+          'value': data_value,
+          'id': ''.join(random.choices(string.ascii_letters + string.digits, k=8)),
+        }
+      }]
+    }
 
   def _convert_to_control_value(self, name: str, value) -> int:
-    if isinstance(self, AcDevice):
-      if name == 't_power':
-        return self.set_power(value)
-      elif name == 't_fan_speed':
-        return self.set_fan_speed(value)
-      elif name == 't_work_mode':
-        return self.set_work_mode(value)
-      elif name == 't_temp_heatcold':
-        return self.set_fast_heat_cold(value)
-      elif name == 't_eco':
-        return self.set_eco(value)
-      elif name == 't_temp':
-        return self.set_temperature(value)
-      elif name == 't_fan_power':
-        return self.set_fan_vertical(value)
-      elif name == 't_fan_leftright':
-        return self.set_fan_horizontal(value)
-      elif name == 't_fan_mute':
-        return self.set_fan_mute(value)
-      elif name == 't_temptype':
-        return self.set_temptype(value)
-    else:
-      return 0
+    raise NotImplementedError()
 
   def queue_status(self) -> None:
     for data_field in fields(self._properties):
@@ -168,6 +149,7 @@ class BaseDevice:
       }
       self._next_command_id += 1
       self.commands_queue.put_nowait((command, None))
+    self._queue_listener()
 
   def update_key(self, key: dict) -> dict:
     return self._config.update(key)
@@ -179,8 +161,9 @@ class BaseDevice:
     return self._config.dev
 
 class AcDevice(BaseDevice):
-  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
-    super().__init__(name, ip_address, lanip_key, lanip_key_id, AcProperties())
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str,
+              notifier: Callable[[None], None]):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, AcProperties(), notifier)
 
   def get_env_temp(self) -> int:
     return self.get_property('f_temp_in')
@@ -335,14 +318,42 @@ class AcDevice(BaseDevice):
     else:
       return self.get_property('t_temptype')
 
+  def _convert_to_control_value(self, name: str, value) -> int:
+    if name == 't_power':
+      return self.set_power(value)
+    elif name == 't_fan_speed':
+      return self.set_fan_speed(value)
+    elif name == 't_work_mode':
+      return self.set_work_mode(value)
+    elif name == 't_temp_heatcold':
+      return self.set_fast_heat_cold(value)
+    elif name == 't_eco':
+      return self.set_eco(value)
+    elif name == 't_temp':
+      return self.set_temperature(value)
+    elif name == 't_fan_power':
+      return self.set_fan_vertical(value)
+    elif name == 't_fan_leftright':
+      return self.set_fan_horizontal(value)
+    elif name == 't_fan_mute':
+      return self.set_fan_mute(value)
+    elif name == 't_temptype':
+      return self.set_temptype(value)
+    else:
+      logging.error('Cannot convert to control value property {}'.format(name))
+      raise ValueError()
+
 class FglDevice(BaseDevice):
-  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
-    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglProperties())
+  def __init__(self, name: str, ip_address: str, lanip_key: str, 
+              lanip_key_id: str, notifier: Callable[[None], None]):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglProperties(), notifier)
 
 class FglBDevice(BaseDevice):
-  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
-    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglBProperties())
+  def __init__(self, name: str, ip_address: str, lanip_key: str, 
+              lanip_key_id: str, notifier: Callable[[None], None]):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglBProperties(), notifier)
 
 class HumidifierDevice(BaseDevice):
-  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
-    super().__init__(name, ip_address, lanip_key, lanip_key_id, HumidifierProperties())
+  def __init__(self, name: str, ip_address: str, lanip_key: str,
+              lanip_key_id: str, notifier: Callable[[None], None]):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, HumidifierProperties(), notifier)

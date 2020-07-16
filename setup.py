@@ -19,10 +19,11 @@ setuptools.setup(
     license='Apache 2.0',
     packages=setuptools.find_packages(),
     install_requires=[
+          'aiohttp',
           'dataclasses_json',
           'pycryptodome',
           'paho-mqtt',
-          'retry'
+          'tenacity'
       ],
     classifiers=[
         "Programming Language :: Python :: 3",
