@@ -27,7 +27,7 @@ class BaseDevice:
     self.ip_address = ip_address
     self._config = Config(lanip_key, lanip_key_id)
     self._properties = properties
-    self._properties_lock = threading.Lock()
+    self._properties_lock = threading.RLock()
     self._queue_listener = notifier
 
     self._next_command_id = 0
@@ -60,8 +60,13 @@ class BaseDevice:
       if value != old_value:
         setattr(self._properties, name, value)
         logging.debug('Updated properties: %s' % self._properties)
+        if name == 't_control_value':
+          self._update_controlled_properties(value)
       if self.property_change_listener:
         self.property_change_listener(self.name, name, value)
+
+  def _update_controlled_properties(self, control_value: int):
+    raise NotImplementedError()
 
   def get_command_seq_no(self) -> int:
     with self._commands_seq_no_lock:
@@ -342,6 +347,37 @@ class AcDevice(BaseDevice):
     else:
       logging.error('Cannot convert to control value property {}'.format(name))
       raise ValueError()
+
+  def _update_controlled_properties(self, control_value: int):
+    power = get_power_value(control_value)
+    self.update_property('t_power', power)
+
+    fan_speed = get_fan_speed_value(control_value)
+    self.update_property('t_fan_speed', fan_speed)
+
+    work_mode = get_work_mode_value(control_value)
+    self.update_property('t_work_mode', work_mode)
+
+    temp_heatcold = get_heat_cold_value(control_value)
+    self.update_property('t_temp_heatcold', temp_heatcold)
+
+    eco = get_eco_value(control_value)
+    self.update_property('t_eco', eco)
+
+    temp = get_temp_value(control_value)
+    self.update_property('t_temp', temp)
+
+    fan_power = get_fan_power_value(control_value)
+    self.update_property('t_fan_power', fan_power)
+
+    fan_horizontal = get_fan_lr_value(control_value)
+    self.update_property('t_fan_leftright', fan_horizontal)
+
+    fan_mute = get_fan_mute_value(control_value)
+    self.update_property('t_fan_mute', fan_mute)
+
+    temptype = get_temptype_value(control_value)
+    self.update_property('t_temptype', temptype)
 
 class FglDevice(BaseDevice):
   def __init__(self, name: str, ip_address: str, lanip_key: str, 
