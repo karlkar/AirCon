@@ -162,7 +162,7 @@ async def run(parsed_args):
     mqtt_client.connect(parsed_args.mqtt_host, parsed_args.mqtt_port)
     for device in devices:
       device.property_change_listener = mqtt_client.mqtt_publish_update
-  
+
   await asyncio.gather(mqtt_loop(mqtt_client),
                       setup_and_run_http_server(parsed_args, devices),
                       query_status_worker(devices),
@@ -172,10 +172,18 @@ def _escape_name(name: str):
   safe_name = name.replace(' ', '_').lower()
   return "".join(x for x in safe_name if x.isalnum())
 
-def discovery(parsed_args):
-  all_configs = perform_discovery(parsed_args.app, parsed_args.user, parsed_args.passwd, 
-                   parsed_args.prefix, parsed_args.device, parsed_args.properties)
+async def discovery(parsed_args):
+  all_configs = await perform_discovery(parsed_args.app, parsed_args.user, parsed_args.passwd,
+                   parsed_args.device, parsed_args.properties)
+  
   for config in all_configs:
+    properties_text = ''
+    if 'properties' in config.keys():
+      properties_text = 'Properties:\n{}'.format(json.dumps(config['properties'], indent=2))
+    print('Device {} has:\nIP address: {}\nlanip_key: {}\nlanip_key_id: {}\n{}\n'.format(
+              config['product_name'], config['lan_ip'],
+              config['lanip_key'], config['lanip_key_id'], properties_text))
+
     file_content = {
       'name': config['product_name'],
       'lan_ip': config['lan_ip'],
@@ -192,4 +200,4 @@ if __name__ == '__main__':
   if (parsed_args.cmd == 'run'):
     asyncio.run(run(parsed_args))
   elif (parsed_args.cmd == 'discovery'):
-    discovery(parsed_args)
+    asyncio.run(discovery(parsed_args))
