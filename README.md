@@ -43,7 +43,7 @@ The module is installed in A/Cs and humidifiers that are either manufactured or 
 
    For example:
    ```bash
-   python3.7 -m aircon discovery tornado-us foo@example.com my_pass --config config.json
+   python3.7 -m aircon discovery tornado-us foo@example.com my_pass
    ```
    The CLI will generate a config file, that needs to be passed to the A/C control server below.
    If you have more than one A/C that you would like to control, create a separate config file for each A/C, and run a separate control process. You can select the A/C that the config is generated for by setting the `--device` flag to the device name you configured in the app.
@@ -169,13 +169,8 @@ Listed here are the properties available through the API:
 
 ## Multiple Air Conditioners
 
-The server script supports a single Air Conditioner. In order to use with multiple Air Conditioners, a separate instance of the server needs to run for each Air Conditioner.
-
-This includes:
-- Create a separate config file for each A/C. Do mind that you select the correct device when running the CLI.
-- Select a different `--port` for the HTTP server of each A/C.
-- If using MQTT, select a different `--mqtt_topic` for each A/C.
-- Create a different service file, that refers to the settings above.
+In order to use with multiple Air Conditioners, simply add multiple --config and --type params.
+MQTT topic will contain your topic defined by flag --mqtt_topic (hisense_ac by default) and device name.
 
 * Note: _The smart home hub configuration should adjusted to refer to the right port or topics._
 

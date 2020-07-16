@@ -1,46 +1,100 @@
-"""
-Server for controlling HiSense Air Conditioner WiFi modules.
-These modules are embedded for example in the Israel Tornado ACs.
-This module is based on reverse engineering of the AC protocol,
-and is not affiliated with HiSense, Tornado or any other relevant
-company.
-
-In order to run this server, you need to provide it with the a
-config file, that likes like this:
-{"lanip_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
- "lanip_key_id":8888,
- "random_1":"YYYYYYYYYYYYYYYY",
- "time_1":201111111111111,
- "random_2":"XXXXXXXXXXXXXXXX",
- "time_2":111111111111}
-
-The random/time values are regenerated on key exchange when the
-server first starts talking with the AC, so is the lanip_key_id.
-The lanip_key, on the other hand, is generated only on the
-HiSense server. In order to get that value, you'll need to run query_cli.py
-
-The code here relies on Python 3.7
-"""
+from copy import deepcopy
 from dataclasses import fields
 import enum
+import logging
 import random
 import string
+import threading
+from typing import Callable
+import queue
 from Crypto.Cipher import AES
 
+from .config import Config, Encryption
+from .control_value_utils import (get_power_value, set_power_value, get_temp_value,
+    set_temp_value, get_work_mode_value, set_work_mode_value, get_fan_speed_value,
+    set_fan_speed_value, get_heat_cold_value, set_heat_cold_value, get_eco_value,
+    set_eco_value, get_fan_power_value, set_fan_power_value, get_fan_lr_value,
+    set_fan_lr_value, get_fan_mute_value, set_fan_mute_value, get_temptype_value,
+    set_temptype_value)
 from .error import Error
-from .properties import FastColdHeat
-from .store import Data
+from .properties import (AcProperties, AirFlow, Economy, FanSpeed, FastColdHeat, FglProperties, FglBProperties, 
+    HumidifierProperties, Properties, Power, AcWorkMode, Quiet, TemperatureUnit)
 
-class DeviceController:
-  def __init__(self, data: Data):
-    self._data = data
+class BaseDevice:
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str, properties: Properties):
+    self.name = name
+    self.ip_address = ip_address
+    self._config = Config(lanip_key, lanip_key_id)
+    self._properties = properties
+    self._properties_lock = threading.Lock()
+
     self._next_command_id = 0
 
+    self.commands_queue = queue.Queue()
+    self._commands_seq_no = 0
+    self._commands_seq_no_lock = threading.Lock()
+
+    self._updates_seq_no = 0
+    self._updates_seq_no_lock = threading.Lock()
+
+    self.change_listener: Callable[[str, str], None] = None
+
+  def get_all_properties(self) -> Properties:
+    with self._properties_lock:
+      return deepcopy(self._properties)
+
+  def get_property(self, name: str):
+    """Get a stored property."""
+    with self._properties_lock:
+      return getattr(self._properties, name)
+
+  def get_property_type(self, name: str):
+    return self._properties.get_type(name)
+
+  def update_property(self, name: str, value) -> None:
+    """Update the stored properties, if changed."""
+    with self._properties_lock:
+      old_value = getattr(self._properties, name)
+      if value != old_value:
+        setattr(self._properties, name, value)
+        logging.debug('Updated properties: %s' % self._properties)
+      if self.change_listener:
+        self.change_listener(self.name, name, value)
+
+  def get_command_seq_no(self) -> int:
+    with self._commands_seq_no_lock:
+      seq_no = self._commands_seq_no
+      self._commands_seq_no += 1
+      return seq_no
+
+  def is_update_valid(self, cur_update_no: int) -> bool:
+    with self._updates_seq_no_lock:
+      # Every once in a while the sequence number is zeroed out, so accept it.
+      if self._updates_seq_no > cur_update_no and cur_update_no > 0:
+        logging.error('Stale update found %d. Last update used is %d.',
+                      cur_update_no, self._updates_seq_no)
+        return False # Old update
+      self._updates_seq_no = cur_update_no
+      return True
+
   def queue_command(self, name: str, value) -> None:
-    if self._data.properties.get_read_only(name):
+    if self._properties.get_read_only(name):
       raise Error('Cannot update read-only property "{}".'.format(name))
-    data_type = self._data.properties.get_type(name)
-    base_type = self._data.properties.get_base_type(name)
+    data_type = self._properties.get_type(name)
+    
+    if name != 't_control_value' and self.get_property('t_control_value'):
+      # Device mode is set using control_value
+      if issubclass(data_type, enum.Enum):
+        data_value = data_type[value]
+      elif data_type is int and type(value) is str and '.' in value:
+        # Round rather than fail if the input is a float.
+        # This is commonly the case for temperatures converted by HA from Celsius.
+        data_value = round(float(value))
+      else:
+        data_value = data_type(value)
+      self._convert_to_control_value(name, data_value)
+      return
+    
     if issubclass(data_type, enum.Enum):
       data_value = data_type[value].value
     elif data_type is int and type(value) is str and '.' in value:
@@ -49,6 +103,8 @@ class DeviceController:
       data_value = round(float(value))
     else:
       data_value = data_type(value)
+
+    base_type = self._properties.get_base_type(name)
     command = {
       'properties': [{
         'property': {
@@ -62,8 +118,8 @@ class DeviceController:
     # There are (usually) no acks on commands, so also queue an update to the
     # property, to be run once the command is sent.
     typed_value = data_type[value] if issubclass(data_type, enum.Enum) else data_value
-    property_updater = lambda: self._data.update_property(name, typed_value)
-    self._data.commands_queue.put_nowait((command, property_updater))
+    property_updater = lambda: self.update_property(name, typed_value)
+    self.commands_queue.put_nowait((command, property_updater))
 
     # Handle turning on FastColdHeat
     if name == 't_temp_heatcold' and typed_value is FastColdHeat.ON:
@@ -72,8 +128,33 @@ class DeviceController:
       self.queue_command('t_sleep', 'STOP')
       self.queue_command('t_temp_eight', 'OFF')
 
+  def _convert_to_control_value(self, name: str, value) -> int:
+    if isinstance(self, AcDevice):
+      if name == 't_power':
+        return self.set_power(value)
+      elif name == 't_fan_speed':
+        return self.set_fan_speed(value)
+      elif name == 't_work_mode':
+        return self.set_work_mode(value)
+      elif name == 't_temp_heatcold':
+        return self.set_fast_heat_cold(value)
+      elif name == 't_eco':
+        return self.set_eco(value)
+      elif name == 't_temp':
+        return self.set_temperature(value)
+      elif name == 't_fan_power':
+        return self.set_fan_vertical(value)
+      elif name == 't_fan_leftright':
+        return self.set_fan_horizontal(value)
+      elif name == 't_fan_mute':
+        return self.set_fan_mute(value)
+      elif name == 't_temptype':
+        return self.set_temptype(value)
+    else:
+      return 0
+
   def queue_status(self) -> None:
-    for data_field in fields(self._data.properties):
+    for data_field in fields(self._properties):
       command = {
         'cmds': [{
           'cmd': {
@@ -86,20 +167,182 @@ class DeviceController:
         }]
       }
       self._next_command_id += 1
-      self._data.commands_queue.put_nowait((command, None))
-      # TODO: Check if it can be done in one request. 
-      # And if we can merge commands when queue has more elements
+      self.commands_queue.put_nowait((command, None))
 
-  def queue_status_bulk(self) -> None:
-    command = {'cmds': []}
-    for data_field in fields(self._data.properties):
-      command['cmds'].append({
-        'cmd': {
-          'method': 'GET',
-          'resource': 'property.json?name=' + data_field.name,
-          'uri': '/local_lan/property/datapoint.json',
-          'data': '',
-          'cmd_id': self._next_command_id,
-        }})
-      self._next_command_id += 1
-    self._data.commands_queue.put_nowait((command, None))
+  def update_key(self, key: dict) -> dict:
+    return self._config.update(key)
+
+  def get_app_encryption(self) -> Encryption:
+    return self._config.app
+
+  def get_dev_encryption(self) -> Encryption:
+    return self._config.dev
+
+class AcDevice(BaseDevice):
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, AcProperties())
+
+  def get_env_temp(self) -> int:
+    return self.get_property('f_temp_in')
+
+  def set_power(self, setting: Power) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_power_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_power', setting)
+
+  def get_power(self) -> Power:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_power_value(control_value)
+    else:
+      return self.get_property('t_power')
+
+  def set_temperature(self, setting: int) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_temp_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_temp', setting)
+
+  def get_temperature(self) -> int:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_temp_value(control_value)
+    else:
+      return self.get_property('t_temp')
+    
+  def set_work_mode(self, setting: AcWorkMode) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_work_mode_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_work_mode', setting)
+
+  def get_work_mode(self) -> AcWorkMode:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_work_mode_value(control_value)
+    else:
+      return self.get_property('t_work_mode')
+
+  def set_fan_speed(self, setting: FanSpeed) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_fan_speed_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_fan_speed', setting)
+
+  def get_fan_speed(self) -> FanSpeed:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_fan_speed_value(control_value)
+    else:
+      return self.get_property('t_fan_speed')
+
+  def set_fan_vertical(self, setting: AirFlow) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_fan_power_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_fan_power', setting)
+
+  def get_fan_vertical(self) -> AirFlow:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_fan_power_value(control_value)
+    else:
+      return self.get_property('t_fan_power')
+
+  def set_fan_horizontal(self, setting: AirFlow) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_fan_lr_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_fan_leftright', setting)
+
+  def get_fan_horizontal(self) -> AirFlow:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_fan_lr_value(control_value)
+    else:
+      return self.get_property('t_fan_leftright')
+
+  def set_fan_mute(self, setting: Quiet) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_fan_mute_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_fan_mute', setting)
+
+  def get_fan_mute(self) -> Quiet:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_fan_mute_value(control_value)
+    else:
+      return self.get_property('t_fan_mute')
+
+  def set_fast_heat_cold(self, setting: FastColdHeat):
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_heat_cold_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_temp_heatcold', setting)
+
+  def get_fast_heat_cold(self) -> FastColdHeat:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_heat_cold_value(control_value)
+    else:
+      return self.get_property('t_temp_heatcold')
+
+  def set_eco(self, setting: Economy) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_eco_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_eco', setting)
+    
+  def get_eco(self) -> Economy:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_eco_value(control_value)
+    else:
+      return self.get_property('t_eco')
+
+  def set_temptype(self, setting: TemperatureUnit) -> None:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      control_value = set_temptype_value(control_value, setting)
+      self.queue_command('t_control_value', control_value)
+    else:
+      self.queue_command('t_temptype', setting)
+
+  def get_temptype(self) -> TemperatureUnit:
+    control_value = self.get_property('t_control_value')
+    if (control_value):
+      return get_temptype_value(control_value)
+    else:
+      return self.get_property('t_temptype')
+
+class FglDevice(BaseDevice):
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglProperties())
+
+class FglBDevice(BaseDevice):
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, FglBProperties())
+
+class HumidifierDevice(BaseDevice):
+  def __init__(self, name: str, ip_address: str, lanip_key: str, lanip_key_id: str):
+    super().__init__(name, ip_address, lanip_key, lanip_key_id, HumidifierProperties())

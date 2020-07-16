@@ -20,10 +20,8 @@ from . import aircon
 from .app_mappings import SECRET_MAP
 from .config import Config
 from .error import Error
-from .aircon import DeviceController
+from .aircon import BaseDevice, AcDevice, FglDevice, FglBDevice, HumidifierDevice
 from .discovery import perform_discovery
-from .properties import AcProperties, FglProperties, FglBProperties, HumidifierProperties
-from .store import Data
 from .mqtt_client import MqttClient
 from .query_handlers import QueryHandlers
 
@@ -32,25 +30,32 @@ class KeepAliveThread(threading.Thread):
   
   _KEEP_ALIVE_INTERVAL = 10.0
 
-  def __init__(self, host: str, port: int, data: Data):
+  def __init__(self, port: int, devices: [BaseDevice]):
     self.run_lock = threading.Condition()
     self._alive = False
-    self._host = host
-    self._port = port
-    self._data = data
+    self._data = []
+    
+    for device in devices:
+      header = {
+        'Accept': 'application/json',
+        'Connection': 'keep-alive',
+        'Content-Type': 'application/json',
+        'Host': device.ip_address,
+        'Accept-Encoding': 'gzip'
+      }
+      self._data.append({
+        'device': device,
+        'headers': header,
+        'conn': None,
+        'last_timestamp': 0
+      })
+
     local_ip = self._get_local_ip()
-    self._headers = {
-      'Accept': 'application/json',
-      'Connection': 'keep-alive',
-      'Content-Type': 'application/json',
-      'Host': self._host,
-      'Accept-Encoding': 'gzip'
-    }
     self._json = {
       'local_reg': {
         'ip': local_ip,
         'notify': 0,
-        'port': self._port,
+        'port': port,
         'uri': "/local_lan"
       }
     }
@@ -68,12 +73,12 @@ class KeepAliveThread(threading.Thread):
         sock.close()
 
   @retry(exceptions=ConnectionError, delay=0.5, max_delay=20, backoff=1.5, logger=logging)
-  def _establish_connection(self, conn: HTTPConnection) -> None:
+  def _establish_connection(self, conn: HTTPConnection, headers: dict, device: BaseDevice) -> None:
     method = 'PUT' if self._alive else 'POST'
-    logging.debug('[KeepAlive] %s /local_reg.json %s', method, json.dumps(self._json))
+    self._json['local_reg']['notify'] = int(device.commands_queue.qsize() > 0)
+    logging.debug('[KeepAlive] %s %s/local_reg.json %s', method, conn.host, json.dumps(self._json))
     try:
-      logging.debug('[KeepAlive] Sending data to %s. Data: %s', conn.host, json.dumps(self._json))
-      conn.request(method, '/local_reg.json', json.dumps(self._json), self._headers)
+      conn.request(method, '/local_reg.json', json.dumps(self._json), headers)
       resp = conn.getresponse()
       if resp.status != HTTPStatus.ACCEPTED:
         raise ConnectionError('Recieved invalid response for local_reg: %d, %s', resp.status, resp.read())
@@ -87,22 +92,30 @@ class KeepAliveThread(threading.Thread):
 
   def run(self) -> None:
     with self.run_lock:
-      try:
-        conn = HTTPConnection(self._host, timeout=5)
-      except InvalidURL:
-        logging.exception('Invalid IP provided.')
-        _thread.interrupt_main()
-        return
-      while True:
+      for entry in self._data:
         try:
-          self._establish_connection(conn)
-        except:
-          logging.exception('Failed to send local_reg keep alive to the AC.')
+          conn = HTTPConnection(entry['device'].ip_address, timeout=5)
+          entry['conn'] = conn
+        except InvalidURL:
+          logging.exception('[KeepAlive] Invalid IP provided.')
           _thread.interrupt_main()
           return
-        logging.debug('[KeepAlive] Waiting for notification or timeout %d', self._data.commands_queue.qsize())
-        self._json['local_reg']['notify'] = int(
-            self._data.commands_queue.qsize() > 0 or self.run_lock.wait(self._KEEP_ALIVE_INTERVAL))
+      while True:
+        should_run_again = False
+        try:
+          for entry in self._data:
+            now = time.time()
+            queue_size = entry['device'].commands_queue.qsize()
+            if now - entry['last_timestamp'] >= self._KEEP_ALIVE_INTERVAL or queue_size > 0:
+              self._establish_connection(entry['conn'], entry['headers'], entry['device'])
+              entry['last_timestamp'] = now
+              if queue_size > 1:
+                should_run_again = True
+        except:
+          logging.exception('[KeepAlive] Failed to send local_reg keep alive to the AC.')
+        if not should_run_again:
+          logging.debug('[KeepAlive] Waiting for notification or timeout')
+          self.run_lock.wait(self._KEEP_ALIVE_INTERVAL)
 
 class QueryStatusThread(threading.Thread):
   """Thread to preiodically query the status of all properties.
@@ -114,30 +127,29 @@ class QueryStatusThread(threading.Thread):
   _STATUS_UPDATE_INTERVAL = 600.0
   _WAIT_FOR_EMPTY_QUEUE = 10.0
 
-  def __init__(self, data: Data, device_controller: DeviceController):
+  def __init__(self, devices: [BaseDevice]):
     super(QueryStatusThread, self).__init__(name='Query Status thread')
-    self._data = data
-    self._device_controller = device_controller
+    self._devices = devices
 
   def run(self) -> None:
     while True:
       # In case the AC is stuck, and not fetching commands, avoid flooding
       # the queue with status updates.
-      while self._data.commands_queue.qsize() > 10:
-        time.sleep(self._WAIT_FOR_EMPTY_QUEUE)
-      self._device_controller.queue_status()
+      for device in self._devices:
+        while device.commands_queue.qsize() > 10:
+          time.sleep(self._WAIT_FOR_EMPTY_QUEUE)
+        device.queue_status()
       if _keep_alive:
         with _keep_alive.run_lock:
           logging.debug('QueryStatusThread triggered KeepAlive notify')
           _keep_alive.run_lock.notify()
       time.sleep(self._STATUS_UPDATE_INTERVAL)
 
-def MakeHttpRequestHandlerClass(config: Config, data: Data, device_controller: DeviceController):
+def MakeHttpRequestHandlerClass(devices: [BaseDevice]):
   class HTTPRequestHandler(BaseHTTPRequestHandler):
     """Handler for AC related HTTP requests."""
     def __init__(self, request, client_address, server):
-      self._query_handlers = QueryHandlers(config, data, device_controller, 
-                                      self._write_response)
+      self._query_handlers = QueryHandlers(devices, self._write_response)
       self._HANDLERS_MAP = {
         '/hisense/status': self._query_handlers.get_status_handler,
         '/hisense/command': self._queue_command,
@@ -159,8 +171,8 @@ def MakeHttpRequestHandlerClass(config: Config, data: Data, device_controller: D
       }
       super(HTTPRequestHandler, self).__init__(request, client_address, server)
 
-    def _queue_command(self, path: str, query: dict, data: dict):
-        self._query_handlers.queue_command_handler(path, query, data)
+    def _queue_command(self, sender: str, path: str, query: dict, data: dict):
+        self._query_handlers.queue_command_handler(sender, path, query, data)
         with _keep_alive.run_lock:
           logging.debug("_queue_command triggered KeepAlive notify")
           _keep_alive.run_lock.notify()
@@ -179,13 +191,14 @@ def MakeHttpRequestHandlerClass(config: Config, data: Data, device_controller: D
 
     def do_GET(self) -> None:
       """Accepts get requests."""
-      logging.debug('GET Request,\nPath: %s\n', self.path)
+      sender = self.client_address[0]
+      logging.debug('GET Request from %s,\nPath: %s\n', sender, self.path)
       parsed_url = urlparse(self.path)
       query = parse_qs(parsed_url.query)
       handler = self._HANDLERS_MAP.get(parsed_url.path)
       if handler:
         try:
-          handler(parsed_url.path, query, {})
+          handler(sender, parsed_url.path, query, {})
           return
         except:
           logging.exception('Failed to parse property.')
@@ -193,17 +206,18 @@ def MakeHttpRequestHandlerClass(config: Config, data: Data, device_controller: D
 
     def do_POST(self):
       """Accepts post requests."""
+      sender = self.client_address[0]
       content_length = int(self.headers['Content-Length'])
       post_data = self.rfile.read(content_length)
-      logging.debug('POST request,\nPath: %s\nHeaders:\n%s\n\nBody:\n%s\n',
-                    str(self.path), str(self.headers), post_data.decode('utf-8'))
+      logging.debug('POST request from %s,\nPath: %s\nHeaders:\n%s\n\nBody:\n%s\n',
+                    sender, str(self.path), str(self.headers), post_data.decode('utf-8'))
       parsed_url = urlparse(self.path)
       query = parse_qs(parsed_url.query)
       data = json.loads(post_data)
       handler = self._HANDLERS_MAP.get(parsed_url.path)
       if handler:
         try:
-          handler(parsed_url.path, query, data)
+          handler(sender, parsed_url.path, query, data)
           return
         except:
           logging.exception('Failed to parse property.')
@@ -225,22 +239,23 @@ def ParseArguments() -> argparse.Namespace:
   parser_run = subparsers.add_parser('run', help='Runs the server to control the device')
   parser_run.add_argument('-p', '--port', required=True, type=int,
                           help='Port for the server.')
-  parser_run.add_argument('--ip', required=True,
-                          help='IP address for the AC.')
-  parser_run.add_argument('--config', required=True,
+  group_device = parser_run.add_argument_group('Device', 'Arguments that are related to the device')
+  group_device.add_argument('--config', required=True, action='append',
                           help='LAN Config file.')
-  parser_run.add_argument('--device_type', default='ac',
+  group_device.add_argument('--type', required=True, action='append',
                           choices={'ac', 'fgl', 'fgl_b', 'humidifier'},
                           help='Device type (for systems other than Hisense A/C).')
-  parser_run.add_argument('--mqtt_host', default=None,
+
+  group_mqtt = parser_run.add_argument_group('MQTT', 'Settings related to the MQTT')
+  group_mqtt.add_argument('--mqtt_host', default=None,
                           help='MQTT broker hostname or IP address.')
-  parser_run.add_argument('--mqtt_port', type=int, default=1883,
+  group_mqtt.add_argument('--mqtt_port', type=int, default=1883,
                           help='MQTT broker port.')
-  parser_run.add_argument('--mqtt_client_id', default=None,
+  group_mqtt.add_argument('--mqtt_client_id', default=None,
                           help='MQTT client ID.')
-  parser_run.add_argument('--mqtt_user', default=None,
+  group_mqtt.add_argument('--mqtt_user', default=None,
                           help='<user:password> for the MQTT channel.')
-  parser_run.add_argument('--mqtt_topic', default='hisense_ac',
+  group_mqtt.add_argument('--mqtt_topic', default='hisense_ac',
                           help='MQTT topic.')
 
   parser_discovery = subparsers.add_parser('discovery', help='Runs the device discovery')
@@ -275,40 +290,51 @@ def setup_logger(log_level):
   logger.addHandler(logging_handler)
 
 def run(parsed_args):
-  config = Config(config_file=parsed_args.config)
-  if parsed_args.device_type == 'ac':
-    data = Data(properties=AcProperties())
-  elif parsed_args.device_type == 'fgl':
-    data = Data(properties=FglProperties())
-  elif parsed_args.device_type == 'fgl_b':
-    data = Data(properties=FglBProperties())
-  elif parsed_args.device_type == 'humidifier':
-    data = Data(properties=HumidifierProperties())
-  else:
-    sys.exit(1)  # Should never get here.
+  if (len(parsed_args.type) != len(parsed_args.config)):
+    raise ValueError("Each device has to have specified type and config file")
 
-  device_controller = DeviceController(data)
+  devices = []
+  for i in range(len(parsed_args.config)):
+    with open(parsed_args.config[i], 'rb') as f:
+      data = json.load(f)
+    name = data['name']
+    ip = data['lan_ip']
+    lanip_key = data['lanip_key']
+    lanip_key_id = data['lanip_key_id']
+    if parsed_args.type[i] == 'ac':
+      device = AcDevice(name, ip, lanip_key, lanip_key_id)
+    elif parsed_args.type[i] == 'fgl':
+      device = FglDevice(name, ip, lanip_key, lanip_key_id)
+    elif parsed_args.type[i] == 'fgl_b':
+      device = FglBDevice(name, ip, lanip_key, lanip_key_id)
+    elif parsed_args.type[i] == 'humidifier':
+      device = HumidifierDevice(name, ip, lanip_key, lanip_key_id)
+    else:
+      logging.error('Unknown type of device: %s', parsed_args.type[i])
+      sys.exit(1)  # Should never get here.
+    devices.append(device)
 
   if parsed_args.mqtt_host:
-    mqtt_topics = {'pub' : '/'.join((parsed_args.mqtt_topic, '{}', 'status')),
-                  'sub' : '/'.join((parsed_args.mqtt_topic, '{}', 'command'))}
-    mqtt_client = MqttClient(parsed_args.mqtt_client_id, data, mqtt_topics, device_controller)
+    mqtt_topics = {'pub' : '/'.join((parsed_args.mqtt_topic, '{}', '{}', 'status')),
+                  'sub' : '/'.join((parsed_args.mqtt_topic, '{}', '{}', 'command'))}
+    mqtt_client = MqttClient(parsed_args.mqtt_client_id, mqtt_topics, devices)
     if parsed_args.mqtt_user:
       mqtt_client.username_pw_set(*parsed_args.mqtt_user.split(':',1))
     mqtt_client.connect(parsed_args.mqtt_host, parsed_args.mqtt_port)
     mqtt_client.loop_start()
-    data.change_listener = mqtt_client.mqtt_publish_update
+    for device in devices:
+      device.change_listener = mqtt_client.mqtt_publish_update
 
   global _keep_alive 
   _keep_alive = None  # type: typing.Optional[KeepAliveThread]
 
-  query_status = QueryStatusThread(data, device_controller)
+  query_status = QueryStatusThread(devices)
   query_status.start()
 
-  _keep_alive = KeepAliveThread(parsed_args.ip, parsed_args.port, data)
+  _keep_alive = KeepAliveThread(parsed_args.port, devices)
   _keep_alive.start()
 
-  httpd = HTTPServer(('', parsed_args.port), MakeHttpRequestHandlerClass(config, data, device_controller))
+  httpd = HTTPServer(('', parsed_args.port), MakeHttpRequestHandlerClass(devices)) #TODO It should be a map of ip -> device
   try:
     httpd.serve_forever()
   except KeyboardInterrupt:
@@ -325,12 +351,10 @@ def discovery(parsed_args):
                    parsed_args.prefix, parsed_args.device, parsed_args.properties)
   for config in all_configs:
     file_content = {
+      'name': config['product_name'],
+      'lan_ip': config['lan_ip'],
       'lanip_key': config['lanip_key'],
-      'lanip_key_id': config['lanip_key_id'],
-      'random_1': '',
-      'time_1': 0,
-      'random_2': '',
-      'time_2': 0
+      'lanip_key_id': config['lanip_key_id']
     }
     with open(parsed_args.prefix + _escape_name(config['product_name']) + '.json', 'w') as f:
       f.write(json.dumps(file_content))
