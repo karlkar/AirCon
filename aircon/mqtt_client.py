@@ -1,11 +1,13 @@
 from dataclasses import fields
 import enum
-import logging
+from logging import getLogger
 import paho.mqtt.client as mqtt
 
 from . import aircon
 from .aircon import BaseDevice
 from .properties import AcWorkMode
+
+_LOGGER = getLogger(__name__)
 
 
 class MqttClient(mqtt.Client):
@@ -29,7 +31,7 @@ class MqttClient(mqtt.Client):
         client.subscribe("$SYS/broker/log/M/subscribe/#")
 
     def mqtt_on_message(self, client: mqtt.Client, userdata, message: mqtt.MQTTMessage):
-        logging.info(
+        _LOGGER.info(
             "MQTT message Topic: {}, Payload {}".format(message.topic, message.payload)
         )
         if message.topic.startswith("$SYS/broker/log/M/subscribe"):
@@ -52,7 +54,7 @@ class MqttClient(mqtt.Client):
         try:
             chosen_device.queue_command(prop_name, payload.upper())
         except Exception:
-            logging.exception(
+            _LOGGER.exception(
                 "Failed to parse value {} for property {}".format(
                     payload.upper(), prop_name
                 )
