@@ -1,3 +1,4 @@
+# TODO make it parent of all exceptions and rename properlys
 class Error(Exception):
     """Error class for AC handling."""
 
@@ -6,6 +7,18 @@ class Error(Exception):
 
 class AuthFailed(Exception):
     """Error class for invalid auth credentials"""
+
+    pass
+
+
+class NotAuthorized(Exception):
+    """Error class for not authorized state"""
+
+    pass
+
+
+class AuthExpiring(Exception):
+    """Authentication expired and needs to be refreshed"""
 
     pass
 

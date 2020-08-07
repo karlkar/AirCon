@@ -53,7 +53,8 @@ class QueryHandlers:
             _LOGGER.error(
                 "[Key_exchange][%s] %s\n%s", device.ip_address, e.title, e.message
             )
-            raise web.HTTPNotFound()
+            await device.async_get_lan_config()
+            raise web.HTTPBadRequest()
         _LOGGER.debug("[Key_exchange][%s] Sending updated keys", device.ip_address)
         return web.json_response(updated_keys)
 

@@ -5,7 +5,7 @@ from logging import getLogger
 import random
 import string
 import threading
-from typing import Any, Callable, List
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 import queue
 from Crypto.Cipher import AES
 
@@ -51,26 +51,25 @@ from .properties import (
     TemperatureUnit,
 )
 
+if TYPE_CHECKING:
+    from .ayla_api import AylaApi
+
 _LOGGER = getLogger(__name__)
 
 
 class BaseDevice:
-    def __init__(
-        self,
-        name: str,
-        ip_address: str,
-        lanip_key: str,
-        lanip_key_id: str,
-        properties: Properties,
-        notifier: Callable[[None], None],
-    ):
-        self.name = name
-        self.ip_address = ip_address
+    def __init__(self, ayla_api: "AylaApi", device_dct: Dict):
+        self._ayla_api = ayla_api
+        self.name = device_dct["product_name"]
+        self.ip_address = device_dct["lan_ip"]
+        self._dsn = device_dct["dsn"]
+        self._mac = device_dct["mac"]
+
         self._available = False
-        self._config = Config(lanip_key, lanip_key_id)
-        self._properties = properties
+        self._config = None
+        self._properties = AcProperties() # TODO: Fix that
         self._properties_lock = threading.RLock()
-        self._queue_listener = notifier
+        self._queue_listener = None  # type: Optional[Callable[[None], None]]
 
         self._next_command_id = 0
 
@@ -81,13 +80,16 @@ class BaseDevice:
         self._updates_seq_no = 0
         self._updates_seq_no_lock = threading.Lock()
 
-        self._property_change_listeners = []  # type List[Callable[[str, Any], None]]
+        self._property_change_listeners = []  # type: List[Callable[[str, Any], None]]
 
     def add_property_change_listener(self, listener: Callable[[str, Any], None]):
         self._property_change_listeners.append(listener)
 
     def remove_property_change_listener(self, listener: Callable[[str, Any], None]):
         self._property_change_listeners.remove(listener)
+
+    def set_queue_listener(self, listener: Optional[Callable[[None], None]]):
+        self._queue_listener = listener
 
     @property
     def available(self) -> bool:
@@ -97,6 +99,34 @@ class BaseDevice:
     def available(self, value: bool):
         self._available = value
         self._notify_listeners("available", value)
+
+    @property
+    def mac(self) -> str:
+        """Returns hardware unique identifier"""
+        return self._mac
+
+    def _update_lan_config(self, lan_config: Dict):
+        lanip_key = lan_config["lanip"]["lanip_key"]
+        lanip_key_id = lan_config["lanip"]["lanip_key_id"]
+        self._config = Config(lanip_key, lanip_key_id)
+
+    @property
+    def lan_config_endpoint(self) -> str:
+        """Endpoint for device metadata"""
+        return f"https://{self._ayla_api.device_server:s}/apiv1/dsns/{self._dsn:s}/lan.json"
+
+    def get_lan_config(self):
+        """Fetch device local config."""
+        resp = self._ayla_api.request("get", self.lan_config_endpoint)
+        self._update_lan_config(resp.json())
+
+    async def async_get_lan_config(self):
+        """Fetch device local config."""
+        async with await self._ayla_api.async_request(
+            "get", self.lan_config_endpoint
+        ) as resp:
+            resp_data = await resp.json()
+        self._update_lan_config(resp_data)
 
     def _notify_listeners(self, prop_name: str, value):
         for listener in self._property_change_listeners:
@@ -186,7 +216,8 @@ class BaseDevice:
             self.queue_command("t_sleep", "STOP")
             self.queue_command("t_temp_eight", "OFF")
 
-        self._queue_listener()
+        if self._queue_listener:
+            self._queue_listener()
 
     def _build_command(self, name: str, data_value: int):
         base_type = self._properties.get_base_type(name)
@@ -225,7 +256,8 @@ class BaseDevice:
             }
             self._next_command_id += 1
             self.commands_queue.put_nowait((command, None))
-        self._queue_listener()
+        if self._queue_listener:
+            self._queue_listener()
 
     def update_key(self, key: dict) -> dict:
         return self._config.update(key)
@@ -238,17 +270,8 @@ class BaseDevice:
 
 
 class AcDevice(BaseDevice):
-    def __init__(
-        self,
-        name: str,
-        ip_address: str,
-        lanip_key: str,
-        lanip_key_id: str,
-        notifier: Callable[[None], None],
-    ):
-        super().__init__(
-            name, ip_address, lanip_key, lanip_key_id, AcProperties(), notifier
-        )
+    def __init__(self, ayla_api: "AylaApi", device_dct: Dict):
+        super().__init__(ayla_api, device_dct)
 
     def get_env_temp(self) -> int:
         return self.get_property("f_temp_in")
@@ -506,42 +529,15 @@ class AcDevice(BaseDevice):
 
 
 class FglDevice(BaseDevice):
-    def __init__(
-        self,
-        name: str,
-        ip_address: str,
-        lanip_key: str,
-        lanip_key_id: str,
-        notifier: Callable[[None], None],
-    ):
-        super().__init__(
-            name, ip_address, lanip_key, lanip_key_id, FglProperties(), notifier
-        )
+    def __init__(self, ayla_api: "AylaApi", device_dct: Dict):
+        super().__init__(ayla_api, device_dct)
 
 
 class FglBDevice(BaseDevice):
-    def __init__(
-        self,
-        name: str,
-        ip_address: str,
-        lanip_key: str,
-        lanip_key_id: str,
-        notifier: Callable[[None], None],
-    ):
-        super().__init__(
-            name, ip_address, lanip_key, lanip_key_id, FglBProperties(), notifier
-        )
+    def __init__(self, ayla_api: "AylaApi", device_dct: Dict):
+        super().__init__(ayla_api, device_dct)
 
 
 class HumidifierDevice(BaseDevice):
-    def __init__(
-        self,
-        name: str,
-        ip_address: str,
-        lanip_key: str,
-        lanip_key_id: str,
-        notifier: Callable[[None], None],
-    ):
-        super().__init__(
-            name, ip_address, lanip_key, lanip_key_id, HumidifierProperties(), notifier
-        )
+    def __init__(self, ayla_api: "AylaApi", device_dct: Dict):
+        super().__init__(ayla_api, device_dct)

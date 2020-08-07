@@ -100,9 +100,6 @@ class Notifier:
                 if queues_empty:
                     _LOGGER.debug("[KeepAlive] Waiting for notification or timeout")
                     try:
-                        # await asyncio.wait_for(
-                        #     self._condition.wait(), timeout=self._KEEP_ALIVE_INTERVAL,
-                        # )
                         await self._wait_on_condition_with_timeout(
                             self._condition, self._KEEP_ALIVE_INTERVAL
                         )
@@ -112,7 +109,7 @@ class Notifier:
                         pass
                 else:
                     # give some time to clean up the queues
-                    _LOGGER.debug("Queues are not empty.")
+                    _LOGGER.debug("[KeepAlive] Queues are not empty.")
                     await asyncio.sleep(self._TIME_TO_HANDLE_REQUESTS)
 
     async def stop(self):
@@ -139,9 +136,7 @@ class Notifier:
         url = "http://{}/local_reg.json".format(config.device.ip_address)
         try:
             _LOGGER.debug(
-                "[KeepAlive] Sending {} {} {}".format(
-                    method, url, json.dumps(self._json)
-                )
+                "[KeepAlive] Sending %s %s %s", method, url, json.dumps(self._json)
             )
             async with session.request(
                 method,
@@ -153,9 +148,9 @@ class Notifier:
                 if resp.status != HTTPStatus.ACCEPTED.value:
                     resp_data = await resp.text()
                     _LOGGER.error(
-                        "[KeepAlive] Sending local_reg failed: {}, {}".format(
-                            resp.status, resp_data
-                        )
+                        "[KeepAlive] Sending local_reg failed: %d, %s",
+                        resp.status,
+                        resp_data,
                     )
                     raise ConnectionError(
                         "Sending local_reg failed: {}, {}".format(
